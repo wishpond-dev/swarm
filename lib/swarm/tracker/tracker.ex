@@ -7,6 +7,7 @@ defmodule Swarm.Tracker do
   replicate data between each other, and/or forward requests to remote trackers as necessary.
   """
   use GenStateMachine, callback_mode: :state_functions
+  alias Swarm.Tracker.TrackerProxy
 
   @sync_nodes_timeout 5_000
   @retry_interval 1_000
@@ -54,7 +55,7 @@ defmodule Swarm.Tracker do
   Authoritatively looks up the pid associated with a given name.
   """
   def whereis(name),
-    do: GenStateMachine.call(__MODULE__, {:whereis, name}, :infinity)
+    do: proxy_call({:whereis, name})
 
   @doc """
   Tracks a process (pid) with the given name.
@@ -63,7 +64,7 @@ defmodule Swarm.Tracker do
   topology changes. It is strictly for global name registration.
   """
   def track(name, pid) when is_pid(pid),
-    do: GenStateMachine.call(__MODULE__, {:track, name, pid, %{}}, :infinity)
+    do: proxy_call({:track, name, pid, %{}})
 
   @doc """
   Tracks a process created via the provided module/function/args with the given name.
@@ -75,27 +76,36 @@ defmodule Swarm.Tracker do
   Provide a timeout value to limit the track call duration. A value of `:infinity` can be used to block indefinitely.
   """
   def track(name, m, f, a, timeout) when is_atom(m) and is_atom(f) and is_list(a),
-    do: GenStateMachine.call(__MODULE__, {:track, name, %{mfa: {m, f, a}}}, timeout)
+    do: proxy_call({:track, name, %{mfa: {m, f, a}}}, timeout)
 
   @doc """
   Stops tracking the given process (pid).
   """
   def untrack(pid) when is_pid(pid),
-    do: GenStateMachine.call(__MODULE__, {:untrack, pid}, :infinity)
+    do: proxy_call({:untrack, pid})
 
   @doc """
   Adds some metadata to the given process (pid). This is primarily used for tracking group membership.
   """
   def add_meta(key, value, pid) when is_pid(pid),
-    do: GenStateMachine.call(__MODULE__, {:add_meta, key, value, pid}, :infinity)
+    do: proxy_call({:add_meta, key, value, pid})
 
   @doc """
   Removes metadata from the given process (pid).
   """
   def remove_meta(key, pid) when is_pid(pid),
-    do: GenStateMachine.call(__MODULE__, {:remove_meta, key, pid}, :infinity)
+    do: proxy_call({:remove_meta, key, pid})
 
   ## Process Internals / Internal API
+
+  defp proxy_call(call, timeout \\ :infinity) do
+    case ignore_node?() do
+      false ->
+        GenStateMachine.call(__MODULE__, call, timeout)
+      true ->
+        GenServer.call(TrackerProxy, {:call, call, timeout}, timeout)
+    end
+  end
 
   defmacrop debug(msg) do
     {current_state, _arity} = __CALLER__.function
@@ -123,7 +133,12 @@ defmodule Swarm.Tracker do
   end
 
   def start_link() do
-    GenStateMachine.start_link(__MODULE__, [], name: __MODULE__)
+    case ignore_node?() do
+      false ->
+        GenStateMachine.start_link(__MODULE__, [], name: __MODULE__)
+      true ->
+        TrackerProxy.start_link()
+    end
   end
 
   def init(_) do
@@ -137,7 +152,7 @@ defmodule Swarm.Tracker do
     # Start monitoring nodes
     :ok = :net_kernel.monitor_nodes(true, [node_type: :all])
     info "started"
-    nodelist = Enum.reject(Node.list(:connected), &ignore_node?/1)
+    nodelist = active_nodes()
     strategy =
       Node.self
       |> Strategy.create()
@@ -920,7 +935,7 @@ defmodule Swarm.Tracker do
               debug "request to remove meta fom #{inspect pid} (#{inspect key}) is causally dominated by local, removing since it exists locally"
               new_meta = Map.drop(meta, [key])
               Registry.update(name, [meta: new_meta, clock: rclock])
-              Clock.event(nclock)              
+              Clock.event(nclock)
             Clock.leq(rclock, lclock) ->
               debug "request to remove meta fom #{inspect pid} (#{inspect key}) is causally dominated by local, ignoring since it doesn't exist locally"
               nclock
@@ -1294,10 +1309,17 @@ defmodule Swarm.Tracker do
   # By default, all nodes are allowed, except those which are remote shell sessions
   # where the node name of the remote shell starts with `remsh` (relx, exrm, and distillery)
   # all use that prefix for remote shells.
-  defp ignore_node?(node) do
+  def ignore_node? do
+    ignore_node?(Node.self)
+  end
+  def ignore_node?(node) do
     blacklist = node_blacklist()
     whitelist = node_whitelist()
     HashRing.Utils.ignore_node?(node, blacklist, whitelist)
+  end
+
+  def active_nodes() do
+    Enum.reject(Node.list(:connected), &ignore_node?/1)
   end
 
   # Used during anti-entropy checks to remove local registrations and replace them with the remote version
